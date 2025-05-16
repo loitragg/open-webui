@@ -2,6 +2,7 @@
 	import { io } from 'socket.io-client';
 	import { spring } from 'svelte/motion';
 	import PyodideWorker from '$lib/workers/pyodide.worker?worker';
+	import { setupFetchInterceptor } from '$lib/utils/fetchWithTokenRefresh';
 
 	let loadingProgress = spring(0, {
 		stiffness: 0.05
@@ -459,20 +460,52 @@
 		const now = Math.floor(Date.now() / 1000); // current time in unix timestamp
 
 		if (!exp) {
-			// If no expiry time is set, do nothing
+			console.log('No token expiration time set');
 			return;
 		}
 
-		if (now >= exp) {
-			await userSignOut();
-			user.set(null);
-
+		// Use a larger buffer (45 seconds) to ensure we catch expiration before backend rejects requests
+		// This ensures a better user experience by proactively logging out
+		if (now >= exp - 45) {
+			console.log(`TOKEN EXPIRING SOON OR EXPIRED! Timestamp: ${exp}, current time: ${now}. FORCING LOGOUT...`);
+			
+			// Force hard redirect to ensure clean state
 			localStorage.removeItem('token');
-			location.href = '/auth';
+			localStorage.removeItem('user');
+			user.set(undefined);
+			
+			// Show notification
+			toast.error('Your session is expiring. Redirecting to login page...');
+			
+			// Use direct window.location for forced reload
+			window.location.href = `/auth?expired=true&t=${Date.now()}`;
+			return;
+		}
+		
+		// If we're getting close to expiration (within 60 seconds), log it
+		if (now >= exp - 60) {
+			console.log(`Token expiring soon: ${exp}, current time: ${now}`);
 		}
 	};
 
+	// Initialize token expiry check on user store update
+	$: if ($user?.expires_at) {
+		try {
+			// Store user info in localStorage to be accessible by token checker
+			localStorage.setItem('user', JSON.stringify({
+				expires_at: $user.expires_at,
+				id: $user.id
+			}));
+		} catch (e) {
+			console.error('Error saving user info:', e);
+		}
+	}
+
 	onMount(async () => {
+		// Setup the fetch interceptor to handle expired tokens
+		// Do this immediately and unconditionally
+		setupFetchInterceptor();
+
 		if (typeof window !== 'undefined' && window.applyTheme) {
 			window.applyTheme();
 		}
@@ -579,7 +612,11 @@
 				if (localStorage.token) {
 					// Get Session User Info
 					const sessionUser = await getSessionUser(localStorage.token).catch((error) => {
-						toast.error(`${error}`);
+						console.error('Session user fetch failed:', error);
+						toast.error(`Authentication error: ${error}`);
+						
+						// Clear token on auth error
+						localStorage.removeItem('token');
 						return null;
 					});
 
@@ -594,11 +631,27 @@
 						if (tokenTimer) {
 							clearInterval(tokenTimer);
 						}
-						tokenTimer = setInterval(checkTokenExpiry, 1000);
+						
+						// Run check immediately
+						checkTokenExpiry();
+						
+						// Then set up frequent checks (every 5 seconds)
+						tokenTimer = setInterval(checkTokenExpiry, 5000);
+						
+						// Add visibility change listener to check token when tab becomes active
+						const handleVisibilityForToken = () => {
+							if (document.visibilityState === 'visible') {
+								console.log('Tab became visible, checking token expiry');
+								checkTokenExpiry();
+							}
+						};
+						
+						document.addEventListener('visibilitychange', handleVisibilityForToken);
 					} else {
 						// Redirect Invalid Session User to /auth Page
 						localStorage.removeItem('token');
-						await goto(`/auth?redirect=${encodedUrl}`);
+						// Use window.location for a complete page reload
+						window.location.href = `/auth?redirect=${encodedUrl}&invalid=true`;
 					}
 				} else {
 					// Don't redirect if we're already on the auth page
