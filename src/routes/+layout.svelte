@@ -2,7 +2,7 @@
 	import { io } from 'socket.io-client';
 	import { spring } from 'svelte/motion';
 	import PyodideWorker from '$lib/workers/pyodide.worker?worker';
-	import { setupFetchInterceptor } from '$lib/utils/fetchWithTokenRefresh';
+	import { setupFetchInterceptor, isTokenExpiringSoon } from '$lib/utils/fetchWithTokenRefresh';
 
 	let loadingProgress = spring(0, {
 		stiffness: 0.05
@@ -457,17 +457,15 @@
 
 	const checkTokenExpiry = async () => {
 		const exp = $user?.expires_at; // token expiry time in unix timestamp
-		const now = Math.floor(Date.now() / 1000); // current time in unix timestamp
-
+		
 		if (!exp) {
 			console.log('No token expiration time set');
 			return;
 		}
 
-		// Use a larger buffer (45 seconds) to ensure we catch expiration before backend rejects requests
-		// This ensures a better user experience by proactively logging out
-		if (now >= exp - 45) {
-			console.log(`TOKEN EXPIRING SOON OR EXPIRED! Timestamp: ${exp}, current time: ${now}. FORCING LOGOUT...`);
+		// Use our dynamic buffer calculation from the fetchWithTokenRefresh module
+		if (isTokenExpiringSoon(exp)) {
+			console.log(`TOKEN EXPIRING SOON! Timestamp: ${exp}, current time: ${Math.floor(Date.now() / 1000)}. FORCING LOGOUT...`);
 			
 			// Force hard redirect to ensure clean state
 			localStorage.removeItem('token');
@@ -481,20 +479,17 @@
 			window.location.href = `/auth?expired=true&t=${Date.now()}`;
 			return;
 		}
-		
-		// If we're getting close to expiration (within 60 seconds), log it
-		if (now >= exp - 60) {
-			console.log(`Token expiring soon: ${exp}, current time: ${now}`);
-		}
 	};
 
 	// Initialize token expiry check on user store update
 	$: if ($user?.expires_at) {
 		try {
 			// Store user info in localStorage to be accessible by token checker
+			// Only store what's needed for token validation
 			localStorage.setItem('user', JSON.stringify({
 				expires_at: $user.expires_at,
-				id: $user.id
+				id: $user.id,
+				jwt_config: $config?.JWT_EXPIRES_IN || "-1" // Track the JWT_EXPIRES_IN setting
 			}));
 		} catch (e) {
 			console.error('Error saving user info:', e);
@@ -635,17 +630,22 @@
 						// Run check immediately
 						checkTokenExpiry();
 						
-						// Then set up frequent checks (every 5 seconds)
-						tokenTimer = setInterval(checkTokenExpiry, 5000);
+						// Then set up checks with a reasonable frequency
+						// Don't check too frequently to avoid unnecessary overhead
+						// but check often enough to catch expiration in time
+						tokenTimer = setInterval(checkTokenExpiry, 7500); // Every 7.5 seconds
 						
 						// Add visibility change listener to check token when tab becomes active
 						const handleVisibilityForToken = () => {
 							if (document.visibilityState === 'visible') {
-								console.log('Tab became visible, checking token expiry');
+								// Check immediately when tab becomes visible again
 								checkTokenExpiry();
 							}
 						};
 						
+						// Clean up old event listener if exists
+						document.removeEventListener('visibilitychange', handleVisibilityForToken);
+						// Add new event listener
 						document.addEventListener('visibilitychange', handleVisibilityForToken);
 					} else {
 						// Redirect Invalid Session User to /auth Page

@@ -1,9 +1,65 @@
 import { goto } from '$app/navigation';
 import { toast } from 'svelte-sonner';
-import { user } from '$lib/stores';
+import { user, config } from '$lib/stores';
 
 // Track redirecting state to prevent multiple redirects
 let isRedirecting = false;
+
+/**
+ * Calculate buffer time based on token duration
+ * - For shorter durations (< 10 min), use smaller buffer (5%)
+ * - For medium durations (< 1 hour), use medium buffer (3%)
+ * - For longer durations, use larger buffer (2%)
+ * - Minimum buffer is 5 seconds
+ * - Maximum buffer is 120 seconds (2 minutes)
+ * 
+ * @param expiresAt Unix timestamp when token expires
+ * @returns Buffer time in seconds
+ */
+export function calculateExpiryBuffer(expiresAt: number): number {
+  // Current time in seconds
+  const now = Math.floor(Date.now() / 1000);
+  
+  // Total token lifetime in seconds
+  const tokenLifetime = expiresAt - now;
+  
+  if (tokenLifetime <= 0) {
+    return 0; // Already expired
+  }
+  
+  let bufferSeconds: number;
+  
+  // For short-lived tokens (< 10 minutes)
+  if (tokenLifetime < 600) {
+    bufferSeconds = Math.max(5, Math.floor(tokenLifetime * 0.05)); // 5% buffer, minimum 5 seconds
+  }
+  // For medium-lived tokens (< 1 hour)
+  else if (tokenLifetime < 3600) {
+    bufferSeconds = Math.floor(tokenLifetime * 0.03); // 3% buffer
+  }
+  // For long-lived tokens
+  else {
+    bufferSeconds = Math.min(120, Math.floor(tokenLifetime * 0.02)); // 2% buffer, maximum 2 minutes
+  }
+  
+  return bufferSeconds;
+}
+
+/**
+ * Checks if a token is about to expire based on expiry time and calculated buffer
+ * 
+ * @param expiresAt Unix timestamp when token expires
+ * @returns true if token is expiring soon, false otherwise
+ */
+export function isTokenExpiringSoon(expiresAt: number | undefined): boolean {
+  if (!expiresAt) return false;
+  
+  const now = Math.floor(Date.now() / 1000);
+  const buffer = calculateExpiryBuffer(expiresAt);
+  
+  // Token is expiring soon if current time + buffer >= expiry time
+  return now >= (expiresAt - buffer);
+}
 
 /**
  * Set up the global fetch interceptor to catch 401 Unauthorized responses
@@ -18,6 +74,18 @@ export function setupFetchInterceptor() {
     try {
       // Call the original fetch function
       const response = await originalFetch.apply(this, [input, init]);
+      
+      // Check for 302 redirects from Microsoft Entra proxy
+      if (response.status === 302) {
+        console.log('302 REDIRECT DETECTED - LIKELY PROXY SESSION EXPIRED', { 
+          url: typeof input === 'string' ? input : input instanceof URL ? input.toString() : 'unknown',
+          location: response.headers.get('location')
+        });
+        
+        // Force logout and redirect immediately
+        forceLogoutAndRedirect('Your proxy session has expired');
+        return response; // Return the response even though we're redirecting
+      }
       
       // Immediately check for 401 status without attempting to parse
       if (response.status === 401) {
@@ -62,7 +130,7 @@ export function setupFetchInterceptor() {
     }
   });
   
-  setInterval(checkTokenValidity, 20000); // Check token validity every 20 seconds
+  setInterval(checkTokenValidity, 15000); // Check token validity every 15 seconds
   
   console.log('Token expiration interceptor installed successfully');
 }
@@ -86,11 +154,9 @@ function checkTokenValidity() {
         const expiresAt = userData?.expires_at;
         
         if (expiresAt) {
-          const now = Math.floor(Date.now() / 1000);
-          
-          // If token expires soon (within 30 seconds) or is expired
-          if (now >= expiresAt - 30) {
-            console.log(`TOKEN EXPIRING/EXPIRED: Expires at ${expiresAt}, current time ${now}`);
+          // Use our dynamic buffer calculation to determine if token is expiring soon
+          if (isTokenExpiringSoon(expiresAt)) {
+            console.log(`TOKEN EXPIRING SOON: Expires at ${expiresAt}, current time ${Math.floor(Date.now() / 1000)}, using buffer of ${calculateExpiryBuffer(expiresAt)} seconds`);
             forceLogoutAndRedirect();
             return;
           }
@@ -100,7 +166,7 @@ function checkTokenValidity() {
       }
     }
     
-    // Also check if we can make a simple authenticated request
+    // Perform a health check as a backup
     fetch(`${window.location.origin}/health`, {
       headers: { Authorization: `Bearer ${token}` }
     }).catch(err => {
@@ -115,13 +181,15 @@ function checkTokenValidity() {
 /**
  * Force logout and redirect to login page - using the most direct methods
  * to ensure the page actually reloads
+ * 
+ * @param customMessage Optional custom message to display during logout
  */
-function forceLogoutAndRedirect() {
+function forceLogoutAndRedirect(customMessage?: string) {
   // Prevent multiple redirects
   if (isRedirecting) return;
   isRedirecting = true;
   
-  console.log('🔐 TOKEN EXPIRED! FORCING LOGOUT AND PAGE RELOAD 🔐');
+  console.log('🔐 SESSION EXPIRED! FORCING LOGOUT AND PAGE RELOAD 🔐');
   
   try {
     // Clear user data
@@ -129,9 +197,10 @@ function forceLogoutAndRedirect() {
     
     // Remove token from localStorage 
     localStorage.removeItem('token');
+    localStorage.removeItem('user');
     
     // Show notification
-    toast.error('Your session has expired. Logging you out...', {
+    toast.error(customMessage || 'Your session has expired. Logging you out...', {
       duration: 3000
     });
     
